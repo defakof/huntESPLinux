@@ -9,6 +9,14 @@
 #include "mem_reader.h"
 #include "../include/game_offsets.h"
 
+/* Set to 1 to enable verbose bone/head debug logging */
+#define BONE_DEBUG 0
+#if BONE_DEBUG
+#define BONE_LOG(...) printf(__VA_ARGS__)
+#else
+#define BONE_LOG(...) ((void)0)
+#endif
+
 struct Vec3 {
     float x, y, z;
     float distance(const Vec3 &o) const {
@@ -18,7 +26,7 @@ struct Vec3 {
 struct Matrix34 { float m[3][4]; Vec3 get_translation() const { return {m[0][3],m[1][3],m[2][3]}; } };
 struct Matrix44 { float m[4][4]; };
 enum EntityType { ENT_UNKNOWN=0, ENT_HUNTER, ENT_BOSS, ENT_GRUNT };
-struct EntityData { Vec3 position; EntityType type; char name[64]; char raw_name[64]; };
+struct EntityData { Vec3 position; Vec3 head_pos; bool has_head; EntityType type; char name[64]; char raw_name[64]; };
 struct GameState { Vec3 local_pos; Matrix44 render_mat; Matrix44 proj_mat; Matrix44 view_proj; std::vector<EntityData> entities; bool valid; int screen_w, screen_h; bool show_all; };
 
 class GameData {
@@ -284,20 +292,22 @@ public:
 
             if (count == 0) goto done;
 
-            /* Bulk read pointer array — 1 read */
-            std::vector<uint64_t> ptrs(count + 1);
-            reader_.read_mem(entsys + ARR_OFF, ptrs.data(), (count + 1) * 8);
+            /* Bulk read pointer array — 1 read (reuse buffer) */
+            ent_ptrs_buf_.resize(count + 1);
+            reader_.read_mem(entsys + ARR_OFF, ent_ptrs_buf_.data(), (count + 1) * 8);
 
-            /* Invalidate type cache periodically (entities can respawn/change) */
-            if (diag_ % 1800 == 0)
+            /* Invalidate caches periodically (entities respawn, char instances get reused) */
+            if (diag_ % 1800 == 0) {
                 ent_type_cache_.clear();
+                head_bone_cache_.clear();
+            }
 
             /* Process entities. For each valid pointer:
              * - If cached as SKIP: skip entirely (0 reads)
              * - If cached with type: read only worldTM for position (1 read)
              * - If not cached: read name_ptr (1 read) + worldTM (1 read) + name string (1 read) */
             for (uint32_t i = 0; i <= count && state.entities.size() < 500; i++) {
-                uint64_t ep = ptrs[i];
+                uint64_t ep = ent_ptrs_buf_[i];
                 if (ep < 0x10000 || ep > 0x800000000000ULL) continue;
 
                 auto cached = ent_type_cache_.find(ep);
@@ -314,10 +324,11 @@ public:
                 if (dist < 3 || dist > 400) continue;
 
                 if (cached != ent_type_cache_.end()) {
-                    /* Known entity type — no more reads needed */
+                    /* Known entity type — read head bone if possible */
                     EntityData ent = {};
                     ent.position = pos;
                     ent.type = cached->second.type;
+                    ent.has_head = read_head_pos(ep, wtm, ent.head_pos);
                     strncpy(ent.name, cached->second.name, 63);
                     strncpy(ent.raw_name, cached->second.raw_name, 63);
                     state.entities.push_back(ent);
@@ -333,12 +344,14 @@ public:
                     EntityType type = ENT_UNKNOWN;
                     const char *display = "";
 
-                    /* Skip known false positives (map geometry, triggers, particles, loot) */
+                    /* Skip known false positives (map geometry, triggers, particles, loot, dressing) */
                     bool skip = strstr(name,"BossArea") || strstr(name,"Proximity_Warning") ||
                                 strstr(name,"_Shape") || strstr(name,"_Register") ||
                                 strstr(name,"_Loot") || strstr(name,"_DroppedItem") ||
                                 strstr(name,"particle") || strstr(name,"GruntWeapon") ||
-                                strstr(name,"Water_Area") || strstr(name,"Swamp_Water");
+                                strstr(name,"Water_Area") || strstr(name,"Swamp_Water") ||
+                                strstr(name,"Dressing.") || strstr(name,"_Ravens") ||
+                                strstr(name,"_Feathers_") || strstr(name,"_Gramophone");
 
                     if (!skip) {
                         /* Hunters — only actual player entities */
@@ -361,10 +374,6 @@ public:
                         else if (strstr(name,"grunts/grunt/") || strstr(name,"_Grunts")) { type = ENT_GRUNT; display = "Grunt"; }
                     }
 
-                    /* Debug: log raw names to help identify unrecognized entities */
-                    if (diag_ < 300 && type != ENT_UNKNOWN)
-                        printf("ENT: '%s' -> %s\n", name, display);
-
                     CachedEnt ce = {}; ce.type = type; strncpy(ce.name, display, 63); strncpy(ce.raw_name, name, 63);
                     ent_type_cache_[ep] = ce;
                     if (type == ENT_UNKNOWN && !state.show_all) continue;
@@ -373,6 +382,7 @@ public:
                     EntityData ent = {};
                     ent.position = pos;
                     ent.type = type;
+                    ent.has_head = read_head_pos(ep, wtm, ent.head_pos);
                     strncpy(ent.name, display, 63);
                     strncpy(ent.raw_name, name, 63);
                     state.entities.push_back(ent);
@@ -385,10 +395,6 @@ public:
         if (state.entities.empty() && diag_ % 600 == 0)
             find_entity_system();
 
-        if (diag_ % 120 == 0)
-            printf("DIAG: ents=%zu cam=(%.0f,%.0f,%.0f) reads/frame~=%zu\n",
-                   state.entities.size(), state.local_pos.x, state.local_pos.y, state.local_pos.z,
-                   3 + state.entities.size());
 
         state.valid = cam_ok;
         return cam_ok;
@@ -461,15 +467,6 @@ private:
         memcpy(&state.render_mat, cam_buf + 0x230, sizeof(Matrix44));
         memcpy(&state.proj_mat, cam_buf + 0x270, sizeof(Matrix44));
 
-        if (diag_ % 120 == 1) {
-            printf("CAM: pos=(%.0f,%.0f,%.0f) fov=%.2f\n",
-                   state.local_pos.x, state.local_pos.y, state.local_pos.z, fov);
-            printf("  ViewMat[0]: %.3f %.3f %.3f %.3f\n",
-                   state.render_mat.m[0][0], state.render_mat.m[0][1],
-                   state.render_mat.m[0][2], state.render_mat.m[0][3]);
-            printf("  ProjMat: xscale=%.3f yscale=%.3f [2][3]=%.3f\n",
-                   state.proj_mat.m[0][0], state.proj_mat.m[1][1], state.proj_mat.m[2][3]);
-        }
 
         return true;
     }
@@ -512,6 +509,230 @@ private:
         return false;
     }
 
+    /* Skeleton bone reading for head position */
+    static constexpr uint64_t OFF_SLOT_CHARINSTANCE = 0x88;
+    static constexpr uint64_t OFF_CHAR_SKELPOSE     = 0xC80;
+    static constexpr uint64_t OFF_SKELPOSE_BONES    = 0x38;  /* aligned bone array (was 0x20 base, broken) */
+    static constexpr uint64_t OFF_CHAR_DEFSKEL      = 0x1C0;
+    static constexpr uint64_t OFF_DEFSKEL_JOINTS    = 0x8;
+    static constexpr uint64_t OFF_DEFSKEL_JOINTCNT  = 0xA0;
+    static constexpr uint64_t BONE_STRUCT_SIZE      = 0x20;  /* QuatTS: Quat(16) + Vec3(12) + float scale(4) */
+    static constexpr uint64_t BONE_POS_OFFSET       = 0x10;
+
+    /* Check if bone name is the actual head bone (not an IK target) */
+    static bool is_real_head_bone(const char *name) {
+        if (strcmp(name, "head") == 0 || strcmp(name, "Head") == 0) return true;
+        if (strcmp(name, "Bip01 Head") == 0) return true;
+        if (strcmp(name, "face_head") == 0) return true;
+        if (strcmp(name, "def_head") == 0) return true;
+        if (strcmp(name, "skull") == 0) return true;
+        return false;
+    }
+
+    /* Fallback: contains "head" but not an IK target/hand bone */
+    static bool is_fallback_head_bone(const char *name) {
+        if (!strstr(name, "Head") && !strstr(name, "head")) return false;
+        /* Reject IK targets, hand references */
+        if (strstr(name, "target")) return false;
+        if (strstr(name, "Target")) return false;
+        if (strstr(name, "hand")) return false;
+        if (strstr(name, "Hand")) return false;
+        if (strstr(name, "RT_")) return false;
+        if (strstr(name, "IK_")) return false;
+        return true;
+    }
+
+    int find_head_bone_index(uint64_t char_instance) {
+        uint64_t def_skel = 0;
+        if (!reader_.read_ptr(char_instance + OFF_CHAR_DEFSKEL, def_skel)) {
+            BONE_LOG("BONE: FAIL read defskel ptr at char_inst+0x%lx\n", OFF_CHAR_DEFSKEL);
+            /* Try alternate offsets for IDefaultSkeleton */
+            for (uint64_t off : {0x1B8UL, 0x1C8UL, 0x1D0UL, 0x1B0UL, 0x200UL}) {
+                reader_.read_ptr(char_instance + off, def_skel);
+                if (def_skel > 0x10000 && def_skel < 0x800000000000ULL) {
+                    uint32_t tc = 0; reader_.read(def_skel + OFF_DEFSKEL_JOINTCNT, tc);
+                    if (tc > 5 && tc < 300) {
+                        BONE_LOG("BONE: Found defskel at alt offset +0x%lx: 0x%lx cnt=%u\n", off, def_skel, tc);
+                        break;
+                    }
+                }
+                def_skel = 0;
+            }
+            if (!def_skel) return -1;
+        }
+        if (def_skel < 0x10000 || def_skel > 0x800000000000ULL) {
+            BONE_LOG("BONE: defskel=0x%lx invalid\n", def_skel);
+            return -1;
+        }
+
+        uint32_t joint_count = 0;
+        reader_.read(def_skel + OFF_DEFSKEL_JOINTCNT, joint_count);
+        if (joint_count == 0 || joint_count > 500) {
+            BONE_LOG("BONE: joint_count=%u invalid (defskel=0x%lx)\n", joint_count, def_skel);
+            /* Try alternate count offsets */
+            for (uint64_t off : {0x98UL, 0xA8UL, 0xB0UL, 0x90UL}) {
+                reader_.read(def_skel + off, joint_count);
+                if (joint_count > 5 && joint_count < 300) {
+                    BONE_LOG("BONE: Found joint count %u at defskel+0x%lx\n", joint_count, off);
+                    break;
+                }
+                joint_count = 0;
+            }
+            if (joint_count == 0 || joint_count > 500) return -1;
+        }
+
+        uint64_t joints_ptr = 0;
+        if (!reader_.read_ptr(def_skel + OFF_DEFSKEL_JOINTS, joints_ptr) ||
+            joints_ptr < 0x10000 || joints_ptr > 0x800000000000ULL) {
+            BONE_LOG("BONE: joints_ptr invalid at defskel+0x%lx\n", OFF_DEFSKEL_JOINTS);
+            return -1;
+        }
+
+        BONE_LOG("BONE: Scanning %u joints at 0x%lx (defskel=0x%lx)\n", joint_count, joints_ptr, def_skel);
+
+        for (uint32_t stride : {0x150U, 0x120U, 0x100U, 0xD8U, 0x98U}) {
+            /* Validate stride: check that first few entries have valid name pointers */
+            int valid_names = 0;
+            for (uint32_t i = 0; i < std::min(joint_count, 5U); i++) {
+                uint64_t np = 0;
+                reader_.read_ptr(joints_ptr + i * stride, np);
+                if (np > 0x10000 && np < 0x800000000000ULL) {
+                    char test[8] = {};
+                    reader_.read_mem(np, test, 7);
+                    if (test[0] >= ' ' && test[0] <= 'z') valid_names++;
+                }
+            }
+            if (valid_names < 2) continue; /* wrong stride */
+
+            /* Two-pass: first exact match, then fallback */
+            static int full_dump_count = 0;
+            bool do_full_dump = (full_dump_count < 3); /* dump all bones for first 3 failing skeletons */
+            int fallback = -1;
+            int neck_idx = -1;
+            for (uint32_t i = 0; i < joint_count; i++) {
+                uint64_t name_ptr = 0;
+                reader_.read_ptr(joints_ptr + i * stride, name_ptr);
+                if (name_ptr < 0x10000 || name_ptr > 0x800000000000ULL) continue;
+                char jname[48] = {};
+                reader_.read_mem(name_ptr, jname, 47);
+
+                /* Dump first 10 bone names always */
+                if (i < 10)
+                    BONE_LOG("  bone[%u] = '%s'\n", i, jname);
+
+                if (is_real_head_bone(jname)) {
+                    BONE_LOG("BONE: Found head bone '%s' at index %u (stride=0x%x)\n", jname, i, stride);
+                    return (int)i;
+                }
+                if (fallback < 0 && is_fallback_head_bone(jname))
+                    fallback = (int)i;
+                /* Track neck/spine as last resort */
+                if (neck_idx < 0 && (strcmp(jname, "neck") == 0 ||
+                    strcmp(jname, "Neck") == 0 || strcmp(jname, "Bip01 Neck") == 0 ||
+                    strcmp(jname, "spine03") == 0 || strcmp(jname, "Spine03") == 0))
+                    neck_idx = (int)i;
+            }
+            if (fallback >= 0) {
+                BONE_LOG("BONE: Using fallback head bone at index %d (stride=0x%x)\n", fallback, stride);
+                return fallback;
+            }
+            /* Full dump for failing skeletons */
+            if (do_full_dump) {
+                full_dump_count++;
+                BONE_LOG("BONE: FULL DUMP of %u joints (stride=0x%x):\n", joint_count, stride);
+                for (uint32_t i = 10; i < joint_count; i++) {
+                    uint64_t np2 = 0;
+                    reader_.read_ptr(joints_ptr + i * stride, np2);
+                    if (np2 < 0x10000 || np2 > 0x800000000000ULL) continue;
+                    char jn2[48] = {};
+                    reader_.read_mem(np2, jn2, 47);
+                    if (jn2[0]) BONE_LOG("  bone[%u] = '%s'\n", i, jn2);
+                }
+            }
+            if (neck_idx >= 0) {
+                BONE_LOG("BONE: No head bone, using neck at index %d as fallback\n", neck_idx);
+                return neck_idx; /* neck is close enough */
+            }
+            BONE_LOG("BONE: Valid stride 0x%x but no head bone found in %u joints\n", stride, joint_count);
+            return -1;
+        }
+
+        return -1;
+    }
+
+    /* Cache key for positional head bone: defskel -> bone index found by position */
+    static constexpr int BONE_IDX_SEARCHING = -2; /* sentinel: positional search not done yet */
+
+    bool read_head_pos(uint64_t ep, const Matrix34 &wtm, Vec3 &out) {
+        uint64_t slots_ptr = 0;
+        if (!reader_.read_ptr(ep + 0xA8, slots_ptr)) return false;
+        if (slots_ptr < 0x10000 || slots_ptr > 0x800000000000ULL) return false;
+
+        uint64_t slot0 = 0;
+        if (!reader_.read_ptr(slots_ptr, slot0)) return false;
+        if (slot0 < 0x10000 || slot0 > 0x800000000000ULL) return false;
+
+        uint64_t char_inst = 0;
+        if (!reader_.read_ptr(slot0 + OFF_SLOT_CHARINSTANCE, char_inst)) return false;
+        if (char_inst < 0x10000 || char_inst > 0x800000000000ULL) return false;
+
+        uint64_t bone_arr = 0;
+        if (!reader_.read_ptr(char_inst + OFF_CHAR_SKELPOSE + OFF_SKELPOSE_BONES, bone_arr)) return false;
+        if (bone_arr < 0x10000 || bone_arr > 0x800000000000ULL) return false;
+
+        /* Find head bone index (cached per char_inst) */
+        int head_idx = -1;
+        auto it = head_bone_cache_.find(char_inst);
+        if (it != head_bone_cache_.end()) {
+            head_idx = it->second;
+        } else {
+            head_idx = find_head_bone_index(char_inst);
+            if (head_idx < 0) {
+                /* Positional fallback: highest Z bone in model space */
+                uint64_t def_skel = 0;
+                reader_.read_ptr(char_inst + OFF_CHAR_DEFSKEL, def_skel);
+                uint32_t jcount = 0;
+                if (def_skel > 0x10000) {
+                    reader_.read(def_skel + OFF_DEFSKEL_JOINTCNT, jcount);
+                    if (jcount > 500) jcount = 0;
+                }
+                if (jcount > 0) {
+                    uint32_t arr_size = jcount * BONE_STRUCT_SIZE;
+                    if (arr_size > 0x10000) arr_size = 0x10000;
+                    std::vector<uint8_t> bone_data(arr_size);
+                    if (reader_.read_mem(bone_arr, bone_data.data(), arr_size)) {
+                        float best_z = -999.0f;
+                        int best_idx = -1;
+                        for (uint32_t i = 1; i < jcount; i++) {
+                            uint32_t off = i * BONE_STRUCT_SIZE + BONE_POS_OFFSET;
+                            if (off + 12 > arr_size) break;
+                            Vec3 *bp = (Vec3 *)(bone_data.data() + off);
+                            if (!std::isnan(bp->z) && bp->z > 1.4f && bp->z < 2.2f &&
+                                fabsf(bp->x) < 0.3f && fabsf(bp->y) < 0.3f &&
+                                bp->z > best_z) {
+                                best_z = bp->z;
+                                best_idx = (int)i;
+                            }
+                        }
+                        if (best_idx >= 0) head_idx = best_idx;
+                    }
+                }
+            }
+            head_bone_cache_[char_inst] = head_idx;
+        }
+        if (head_idx < 0) return false;
+
+        Vec3 model_pos = {};
+        if (!reader_.read_mem(bone_arr + head_idx * BONE_STRUCT_SIZE + BONE_POS_OFFSET,
+                              &model_pos, sizeof(Vec3))) return false;
+        if (std::isnan(model_pos.x) || fabsf(model_pos.x) > 50) return false;
+
+        out.x = wtm.m[0][0]*model_pos.x + wtm.m[0][1]*model_pos.y + wtm.m[0][2]*model_pos.z + wtm.m[0][3];
+        out.y = wtm.m[1][0]*model_pos.x + wtm.m[1][1]*model_pos.y + wtm.m[1][2]*model_pos.z + wtm.m[1][3];
+        out.z = wtm.m[2][0]*model_pos.x + wtm.m[2][1]*model_pos.y + wtm.m[2][2]*model_pos.z + wtm.m[2][3];
+        return true;
+    }
+
     MemReader reader_;
     int32_t pid_;
     uint64_t gamehunt_base_, gamehunt_size_, genv_addr_, direct_entsys_, entsys_data_addr_, huntgame_base_;
@@ -520,4 +741,6 @@ private:
     int diag_;
     struct CachedEnt { EntityType type; char name[64]; char raw_name[64]; };
     std::unordered_map<uint64_t, CachedEnt> ent_type_cache_;
+    std::unordered_map<uint64_t, int> head_bone_cache_;
+    std::vector<uint64_t> ent_ptrs_buf_; /* reusable buffer for entity pointer array */
 };

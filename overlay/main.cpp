@@ -58,6 +58,8 @@ struct EspSettings {
 
 static EspSettings g_settings;
 static bool g_menu_open = false;
+static std::vector<char> g_selected; /* per-entity selection state (char to avoid vector<bool>) */
+static int g_last_clicked = -1;      /* last clicked row for shift-select */
 
 static ImU32 color4_to_u32(const float c[4]) {
     return IM_COL32((int)(c[0]*255), (int)(c[1]*255), (int)(c[2]*255), (int)(c[3]*255));
@@ -147,10 +149,11 @@ static void draw_esp(const GameState &state) {
         if (!world_to_screen(state.render_mat, state.proj_mat, ent.position, sw, sh, sx, sy))
             continue;
 
-        Vec3 head = ent.position;
-        head.z += (ent.type == ENT_HUNTER) ? 1.8f : 2.0f;
+        /* Box top = head or estimated top of entity */
+        Vec3 top = ent.position;
+        top.z += (ent.type == ENT_HUNTER) ? 1.8f : 2.0f;
         float hx, hy;
-        if (!world_to_screen(state.render_mat, state.proj_mat, head, sw, sh, hx, hy))
+        if (!world_to_screen(state.render_mat, state.proj_mat, top, sw, sh, hx, hy))
             continue;
 
         float box_h = fabsf(sy - hy);
@@ -162,6 +165,21 @@ static void draw_esp(const GameState &state) {
 
         draw->AddRect(ImVec2(x1-1,y1-1), ImVec2(x2+1,y2+1), IM_COL32(0,0,0,200), 0, 0, 1.0f);
         draw->AddRect(ImVec2(x1,y1), ImVec2(x2,y2), color, 0, 0, 1.5f);
+
+        /* Head dot — disabled for now, bone offsets need more work
+        float dot_r = box_h * 0.06f;
+        if (dot_r < 2.0f) dot_r = 2.0f;
+        float hdx, hdy;
+        if (ent.has_head &&
+            world_to_screen(state.render_mat, state.proj_mat, ent.head_pos, sw, sh, hdx, hdy)) {
+            draw->AddCircleFilled(ImVec2(hdx, hdy), dot_r + 1.0f, IM_COL32(0,0,0,200));
+            draw->AddCircleFilled(ImVec2(hdx, hdy), dot_r, color);
+        } else {
+            float head_y = y1 + box_h * 0.08f;
+            draw->AddCircleFilled(ImVec2(sx, head_y), dot_r + 1.0f, IM_COL32(0,0,0,200));
+            draw->AddCircleFilled(ImVec2(sx, head_y), dot_r, color);
+        }
+        */
 
         /* Label */
         char label[128];
@@ -215,7 +233,41 @@ static void draw_menu(const GameState &state) {
         }
 
         if (ImGui::BeginTabItem("Entities")) {
-            ImGui::Text("Visible: %zu", state.entities.size());
+            /* Resize selection vector to match entity count */
+            g_selected.resize(state.entities.size(), 0);
+            if (g_selected.size() > state.entities.size())
+                g_selected.resize(state.entities.size());
+
+            /* Count selected */
+            int sel_count = 0;
+            for (bool s : g_selected) if (s) sel_count++;
+
+            ImGui::Text("Visible: %zu | Selected: %d", state.entities.size(), sel_count);
+            ImGui::SameLine();
+            if (ImGui::Button("Copy Selected") && sel_count > 0) {
+                std::string clip;
+                for (size_t i = 0; i < state.entities.size(); i++) {
+                    if (!g_selected[i]) continue;
+                    auto &e = state.entities[i];
+                    float d = state.local_pos.distance(e.position);
+                    char line[256];
+                    snprintf(line, sizeof(line), "%s\t%s\t%.0fm\t%.0f,%.0f,%.0f\n",
+                             get_entity_label(e.type),
+                             e.raw_name[0] ? e.raw_name : e.name,
+                             d, e.position.x, e.position.y, e.position.z);
+                    clip += line;
+                }
+                ImGui::SetClipboardText(clip.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Select All")) {
+                for (auto &s : g_selected) s = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear")) {
+                for (auto &s : g_selected) s = false;
+                g_last_clicked = -1;
+            }
             ImGui::Separator();
 
             if (ImGui::BeginTable("ent_table", 4,
@@ -228,12 +280,37 @@ static void draw_menu(const GameState &state) {
                 ImGui::TableSetupColumn("Pos", ImGuiTableColumnFlags_WidthFixed, 140);
                 ImGui::TableHeadersRow();
 
-                for (const auto &ent : state.entities) {
+                for (size_t i = 0; i < state.entities.size(); i++) {
+                    auto &ent = state.entities[i];
                     ImGui::TableNextRow();
                     ImU32 col = get_type_color(ent.type);
                     ImVec4 colv = ImGui::ColorConvertU32ToFloat4(col);
 
+                    /* Selectable spanning full row */
                     ImGui::TableSetColumnIndex(0);
+                    char sel_id[32];
+                    snprintf(sel_id, sizeof(sel_id), "##row%zu", i);
+                    bool selected = (i < g_selected.size()) ? g_selected[i] : false;
+                    if (ImGui::Selectable(sel_id, selected,
+                            ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                        ImGuiIO &sio = ImGui::GetIO();
+                        if (sio.KeyShift && g_last_clicked >= 0) {
+                            /* Shift+click: range select */
+                            int lo = (g_last_clicked < (int)i) ? g_last_clicked : (int)i;
+                            int hi = (g_last_clicked > (int)i) ? g_last_clicked : (int)i;
+                            for (int r = lo; r <= hi; r++)
+                                g_selected[r] = true;
+                        } else if (sio.KeyCtrl) {
+                            /* Ctrl+click: toggle single */
+                            g_selected[i] = !g_selected[i];
+                        } else {
+                            /* Plain click: select only this */
+                            for (auto &s : g_selected) s = false;
+                            g_selected[i] = true;
+                        }
+                        g_last_clicked = (int)i;
+                    }
+                    ImGui::SameLine();
                     ImGui::TextColored(colv, "%s", get_entity_label(ent.type));
 
                     ImGui::TableSetColumnIndex(1);
@@ -335,23 +412,20 @@ int main(int argc, char **argv) {
     Display *xdpy = glfwGetX11Display();
     Window xwin = glfwGetX11Window(window);
 
+    /* Override-redirect: bypass window manager stacking.
+     * This makes the overlay an unmanaged surface that renders above
+     * fullscreen windows on KDE Wayland/XWayland. */
+    XUnmapWindow(xdpy, xwin);
+    XSetWindowAttributes or_attrs = {};
+    or_attrs.override_redirect = True;
+    XChangeWindowAttributes(xdpy, xwin, CWOverrideRedirect, &or_attrs);
+    XMapWindow(xdpy, xwin);
+    XFlush(xdpy);
+
     set_clickthrough(xdpy, xwin, true);
 
-    /* Always on top + skip taskbar */
-    {
-        Atom wm_state = XInternAtom(xdpy, "_NET_WM_STATE", False);
-        Atom wm_above = XInternAtom(xdpy, "_NET_WM_STATE_ABOVE", False);
-        Atom wm_skip_taskbar = XInternAtom(xdpy, "_NET_WM_STATE_SKIP_TASKBAR", False);
-        Atom wm_skip_pager = XInternAtom(xdpy, "_NET_WM_STATE_SKIP_PAGER", False);
-        Atom states[] = { wm_above, wm_skip_taskbar, wm_skip_pager };
-        XChangeProperty(xdpy, xwin, wm_state, XA_ATOM, 32,
-                        PropModeReplace, (unsigned char *)states, 3);
-        Atom wm_type = XInternAtom(xdpy, "_NET_WM_WINDOW_TYPE", False);
-        Atom wm_type_notif = XInternAtom(xdpy, "_NET_WM_WINDOW_TYPE_NOTIFICATION", False);
-        XChangeProperty(xdpy, xwin, wm_type, XA_ATOM, 32,
-                        PropModeReplace, (unsigned char *)&wm_type_notif, 1);
-        XFlush(xdpy);
-    }
+    /* Position at top-left (re-apply after remap) */
+    glfwSetWindowPos(window, 0, 0);
 
     /* ImGui setup */
     IMGUI_CHECKVERSION();
