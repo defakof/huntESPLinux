@@ -1,0 +1,26 @@
+# Build artifacts
+overlay/build/
+driver/*.ko
+driver/*.o
+driver/*.mod
+driver/*.mod.c
+driver/*.mod.o
+driver/modules.order
+driver/Module.symvers
+driver/.*.cmd
+driver/.tmp_versions/
+
+# Game binaries (not ours)
+*.exe
+*.dll
+*.exe.id0
+*.exe.id1
+*.exe.id2
+*.exe.nam
+*.exe.til
+
+# Reference project (not ours)
+HuntDMA-main/
+
+# Claude memory
+.claude/
